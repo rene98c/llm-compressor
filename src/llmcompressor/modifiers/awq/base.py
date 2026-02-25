@@ -148,6 +148,11 @@ class AWQModifier(Modifier, QuantizationMixin):
         this specifies how many grid points should be used. To decrease the runtime,
         at the possible cost of slightly worse scales, this can be decreased.
         Defaults to 20
+    :param grid_batch_size: batch size for forward passes during grid search.
+        During grid search only one parent module is on GPU, so larger batch sizes
+        are feasible even when calibration used batch_size=1. Set to None (default)
+        for auto-detection, or 1 to disable rebatching. Typical values: 8-16 for
+        modules containing attention, 32-64 for MLP-only modules.
     """
 
     # Allow arbitrary types because AWQMapping has fields of type torch.nn.Module
@@ -159,6 +164,7 @@ class AWQModifier(Modifier, QuantizationMixin):
     offload_device: torch.device | None | Sentinel = Sentinel("not_provided")
     duo_scaling: bool | Literal["both"] = True
     n_grid: int = 20
+    grid_batch_size: int | None = None
 
     # Private vars set during initialization, cleared during finalization
     _resolved_mappings: list[ResolvedMapping] = PrivateAttr(default_factory=list)
@@ -523,6 +529,29 @@ class AWQModifier(Modifier, QuantizationMixin):
                 calibration_forward_context(model),
                 HooksMixin.disable_hooks(),
             ):
+                # Rebatch cached inputs for grid search efficiency.
+                # During grid search only this parent module is on GPU,
+                # so we can use larger batch sizes than during calibration.
+                original_cache = self._parent_args_cache[parent_module]
+                gbs = self._detect_grid_batch_size(mapping)
+                num_original = len(original_cache)
+                if gbs > 1 and num_original > 1:
+                    rebatched_cache = self._rebatch_cache_inputs(
+                        original_cache, gbs
+                    )
+                    self._parent_args_cache[parent_module] = rebatched_cache
+
+                    # Rebatch loss masks to match
+                    session = active_session()
+                    orig_loss_masks = (
+                        session.state.loss_masks if session.state else None
+                    )
+                    rebatched_loss_masks = self._rebatch_loss_masks(
+                        orig_loss_masks, gbs, num_original
+                    )
+                else:
+                    rebatched_loss_masks = None
+
                 # Compute output of unquantized module
                 fp16_outputs = self._run_samples(parent_module)
                 if len(fp16_outputs) == 0 or all(f.numel() == 0 for f in fp16_outputs):
@@ -532,6 +561,8 @@ class AWQModifier(Modifier, QuantizationMixin):
                         "when certain experts are not activated by calibration samples."
                     )
                     del self._smooth_activation_means[mapping.smooth_name]
+                    # Restore original cache before continuing
+                    self._parent_args_cache[parent_module] = original_cache
                     continue
                 if not all(
                     [fp16_output.isfinite().all() for fp16_output in fp16_outputs]
@@ -546,6 +577,8 @@ class AWQModifier(Modifier, QuantizationMixin):
                         "https://github.com/vllm-project/llm-compressor/issues"
                     )
                     del self._smooth_activation_means[mapping.smooth_name]
+                    # Restore original cache before continuing
+                    self._parent_args_cache[parent_module] = original_cache
                     continue
 
                 orig_layer_weights = {
@@ -554,8 +587,14 @@ class AWQModifier(Modifier, QuantizationMixin):
                 }
 
                 best_scales = self._compute_best_scale(
-                    mapping, fp16_outputs, orig_layer_weights
+                    mapping,
+                    fp16_outputs,
+                    orig_layer_weights,
+                    loss_masks=rebatched_loss_masks,
                 )
+
+                # Restore original cache after grid search
+                self._parent_args_cache[parent_module] = original_cache
 
                 @torch.no_grad()
                 def _smooth(
@@ -616,11 +655,130 @@ class AWQModifier(Modifier, QuantizationMixin):
             for output in outputs
         ]
 
+    def _detect_grid_batch_size(self, mapping: ResolvedMapping) -> int:
+        """
+        Auto-detect safe grid batch size for a given mapping.
+
+        During grid search only the parent module is on GPU, so we can use
+        larger batch sizes than during calibration. Attention-containing modules
+        have O(batch * seq^2) memory so we use a conservative default.
+
+        :param mapping: the resolved mapping being processed
+        :return: grid batch size to use
+        """
+        if self.grid_batch_size is not None:
+            return self.grid_batch_size
+
+        has_attention = any(
+            "attn" in name.lower() or "attention" in name.lower()
+            for name, _ in mapping.parent.named_modules()
+        )
+
+        if has_attention:
+            return 8
+        else:
+            return 32
+
+    @staticmethod
+    def _rebatch_cache_inputs(
+        cache: IntermediatesCache,
+        grid_batch_size: int,
+    ) -> IntermediatesCache:
+        """
+        Merge cached single-sample inputs into larger batches for grid search.
+
+        During calibration, batch_size=1 is used because the full model occupies
+        GPU memory. During grid search, only one parent module is active, so we
+        can rebatch the cached inputs for better GPU utilization.
+
+        :param cache: IntermediatesCache containing single-sample entries
+        :param grid_batch_size: target batch size for rebatched inputs
+        :return: new IntermediatesCache with fewer, larger entries
+        """
+        n = len(cache)
+        if grid_batch_size <= 1 or n <= 1:
+            return cache
+
+        rebatched = IntermediatesCache(offload_device=cache.offload_device)
+
+        for start in range(0, n, grid_batch_size):
+            end = min(start + grid_batch_size, n)
+            group = [cache.fetch(i) for i in range(start, end)]
+
+            if len(group) == 1:
+                rebatched.append(group[0])
+                continue
+
+            try:
+                merged = {}
+                for key in group[0].keys():
+                    values = [g[key] for g in group]
+                    first = values[0]
+                    if isinstance(first, torch.Tensor):
+                        merged[key] = torch.cat(values, dim=0)
+                    elif isinstance(first, tuple):
+                        merged[key] = tuple(
+                            torch.cat([v[i] for v in values], dim=0)
+                            if isinstance(values[0][i], torch.Tensor)
+                            else values[0][i]
+                            for i in range(len(first))
+                        )
+                    elif first is None:
+                        merged[key] = None
+                    else:
+                        merged[key] = first
+                rebatched.append(merged)
+            except (RuntimeError, TypeError):
+                # Shape mismatch or unsupported types — fall back to original
+                logger.warning(
+                    "Grid search rebatching failed, falling back to "
+                    "grid_batch_size=1. This may happen with variable-length "
+                    "sequences or unusual attention mask shapes."
+                )
+                return cache
+
+            del group
+
+        logger.info(
+            f"Grid search rebatched: {n} -> {len(rebatched)} batches "
+            f"(grid_batch_size={grid_batch_size})"
+        )
+        return rebatched
+
+    @staticmethod
+    def _rebatch_loss_masks(
+        loss_masks: list[torch.Tensor] | None,
+        grid_batch_size: int,
+        num_original: int,
+    ) -> list[torch.Tensor] | None:
+        """
+        Rebatch loss masks to match rebatched forward pass outputs.
+
+        :param loss_masks: original per-sample loss masks, or None
+        :param grid_batch_size: target batch size matching _rebatch_cache_inputs
+        :param num_original: number of original batches (for bounds check)
+        :return: rebatched loss masks, or None if input was None
+        """
+        if loss_masks is None or grid_batch_size <= 1:
+            return loss_masks
+
+        rebatched = []
+        for start in range(0, num_original, grid_batch_size):
+            end = min(start + grid_batch_size, num_original)
+            group = loss_masks[start:end]
+            if all(m is not None for m in group):
+                rebatched.append(torch.cat(group, dim=0))
+            else:
+                rebatched.append(None)
+
+        return rebatched
+
     def _compute_best_scale(
         self,
         mapping: ResolvedMapping,
         fp16_outputs: list[torch.Tensor],
         orig_layer_weights: dict[torch.nn.Module, torch.Tensor],
+        loss_masks: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Select best scales for a given mapping in a grid search
@@ -749,7 +907,9 @@ class AWQModifier(Modifier, QuantizationMixin):
                 int_w_outputs = self._run_samples(mapping.parent)
 
                 # compute mean squared error (L2 norm)
-                loss = self._compute_loss(fp16_outputs, int_w_outputs)
+                loss = self._compute_loss(
+                    fp16_outputs, int_w_outputs, loss_masks=loss_masks
+                )
                 del int_w_outputs
 
                 if initial_error is None:
@@ -803,9 +963,11 @@ class AWQModifier(Modifier, QuantizationMixin):
         self,
         fp16_outputs: list[torch.Tensor],
         int_w_outputs: list[torch.Tensor],
+        loss_masks: list[torch.Tensor] | None = None,
     ) -> float:
-        session = active_session()
-        loss_masks = session.state.loss_masks if session.state else None
+        if loss_masks is None:
+            session = active_session()
+            loss_masks = session.state.loss_masks if session.state else None
 
         loss = 0.0
         num_elements = 0
