@@ -739,7 +739,7 @@ class AWQModifier(Modifier, QuantizationMixin):
 
             del group
 
-        logger.info(
+        logger.debug(
             f"Grid search rebatched: {n} -> {len(rebatched)} batches "
             f"(grid_batch_size={grid_batch_size})"
         )
